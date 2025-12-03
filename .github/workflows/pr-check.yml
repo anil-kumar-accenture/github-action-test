@@ -27,7 +27,8 @@ jobs:
            const owner = context.repo.owner;
            const repo = context.repo.repo;
            core.info(`Evaluating environment policy for PR #${prNumber}`);
-           // 1) List changed files
+           core.info(`Event name: ${context.eventName}`);
+           // 1) Get all changed files
            const files = await github.paginate(
              github.rest.pulls.listFiles,
              {
@@ -38,8 +39,9 @@ jobs:
              }
            );
            if (files.length === 0) {
-             core.info("No files changed in this PR. Treating as higher-env (2 approvals required).");
+             core.info("No files changed in this PR. Treating as higher-env (approvals required).");
            }
+           // 2) Define lab-only folders
            const labOnlyPrefixes = [
              "environment_config/lab",
              "schema_config/salesforce/lab"
@@ -62,7 +64,25 @@ jobs:
              core.info("All changed files are lab-only. No approvals required. Policy check PASSED.");
              return;
            }
-           core.info("Non-lab or shared files detected. Enforcing 2-approval rule.");
+           core.info("Non-lab or shared files detected. Enforcing approval rule.");
+           // 3) Count distinct APPROVED reviewers
+           const approvers = new Set();
+           // 3a) If triggered by a review event, include that review immediately
+           if (context.eventName === "pull_request_review") {
+             const reviewEvent = context.payload.review;
+             if (
+               reviewEvent &&
+               reviewEvent.user &&
+               reviewEvent.user.login &&
+               String(reviewEvent.state).toLowerCase() === "approved"
+             ) {
+               core.info(`Including approver from event payload: ${reviewEvent.user.login}`);
+               approvers.add(reviewEvent.user.login);
+             } else {
+               core.info("Review event is not APPROVED; ignoring it.");
+             }
+           }
+           // 3b) Also fetch all reviews from API (covers older approvals)
            const reviews = await github.paginate(
              github.rest.pulls.listReviews,
              {
@@ -72,19 +92,23 @@ jobs:
                per_page: 100,
              }
            );
-           const approvers = new Set();
            for (const review of reviews) {
-             if (review.state === "APPROVED" && review.user && review.user.login) {
+             if (
+               review.state === "APPROVED" &&
+               review.user &&
+               review.user.login
+             ) {
                approvers.add(review.user.login);
              }
            }
            const approvalCount = approvers.size;
            core.info(`Found ${approvalCount} approver(s): ${Array.from(approvers).join(", ") || "none"}`);
-           const REQUIRED_APPROVALS = 1;
+           const REQUIRED_APPROVALS = 1; 
            if (approvalCount >= REQUIRED_APPROVALS) {
-             core.info(`Higher-env change approved by ${approvalCount} reviewers. Policy check PASSED.`);
+             core.info(`Higher-env change approved by ${approvalCount} reviewer(s). Policy check PASSED.`);
              return;
            }
            core.setFailed(
-             `Higher-env or shared files changed — requires ${REQUIRED_APPROVALS} approvals, but only ${approvalCount} found.`
+             `Higher-env or shared files changed. ` +
+             `Requires ${REQUIRED_APPROVALS} approval(s), but only ${approvalCount} found.`
            );
