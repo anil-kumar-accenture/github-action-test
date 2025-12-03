@@ -1,0 +1,88 @@
+name: Environment Policy Check
+on:
+ pull_request:
+   types: [opened, synchronize, reopened, edited, ready_for_review, review_requested, review_request_removed]
+   branches:
+     - main
+permissions:
+ contents: read
+ pull-requests: read
+jobs:
+ environment-policy:
+   runs-on: ubuntu-latest
+   steps:
+     - name: Check PR policy (lab-only vs higher-env)
+       uses: actions/github-script@v7
+       with:
+         github-token: ${{ secrets.GITHUB_TOKEN }}
+         script: |
+           const pr = context.payload.pull_request;
+           if (!pr) {
+             core.setFailed("No pull_request context found.");
+             return;
+           }
+           const prNumber = pr.number;
+           const owner = context.repo.owner;
+           const repo = context.repo.repo;
+           core.info(`Evaluating environment policy for PR #${prNumber}`);
+           // 1) List changed files
+           const files = await github.paginate(
+             github.rest.pulls.listFiles,
+             {
+               owner,
+               repo,
+               pull_number: prNumber,
+               per_page: 100,
+             }
+           );
+           if (files.length === 0) {
+             core.info("No files changed in this PR. Treating as higher-env (2 approvals required).");
+           }
+           const labOnlyPrefixes = [
+             "environment_config/lab",
+             "schema_config/salesforce/lab"
+           ];
+           function isLabOnlyFile(path) {
+             return labOnlyPrefixes.some(prefix => path.startsWith(prefix));
+           }
+           let allLabOnly = true;
+           for (const file of files) {
+             const filename = file.filename;
+             core.info(`Changed file: ${filename}`);
+             if (!isLabOnlyFile(filename)) {
+               allLabOnly = false;
+             }
+           }
+           if (files.length === 0) {
+             allLabOnly = false;
+           }
+           if (allLabOnly) {
+             core.info("All changed files are lab-only. No approvals required. Policy check PASSED.");
+             return;
+           }
+           core.info("Non-lab or shared files detected. Enforcing 2-approval rule.");
+           const reviews = await github.paginate(
+             github.rest.pulls.listReviews,
+             {
+               owner,
+               repo,
+               pull_number: prNumber,
+               per_page: 100,
+             }
+           );
+           const approvers = new Set();
+           for (const review of reviews) {
+             if (review.state === "APPROVED" && review.user && review.user.login) {
+               approvers.add(review.user.login);
+             }
+           }
+           const approvalCount = approvers.size;
+           core.info(`Found ${approvalCount} approver(s): ${Array.from(approvers).join(", ") || "none"}`);
+           const REQUIRED_APPROVALS = 1;
+           if (approvalCount >= REQUIRED_APPROVALS) {
+             core.info(`Higher-env change approved by ${approvalCount} reviewers. Policy check PASSED.`);
+             return;
+           }
+           core.setFailed(
+             `Higher-env or shared files changed — requires ${REQUIRED_APPROVALS} approvals, but only ${approvalCount} found.`
+           );
